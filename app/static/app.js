@@ -104,8 +104,11 @@ async function api(method, url, body) {
   let data = null;
   try { data = await resp.json(); } catch (_) { /* 非 JSON */ }
   if (!resp.ok) {
-    const errs = data && data.detail && data.detail.errors;
-    throw new Error(errs ? errs.join("\n") : `请求失败 (${resp.status})`);
+    const detail = data && data.detail;
+    const errs = detail && detail.errors;
+    const msg = errs ? errs.join("\n")
+      : (typeof detail === "string" ? detail : `请求失败 (${resp.status})`);
+    throw new Error(msg);
   }
   return data;
 }
@@ -257,6 +260,7 @@ function renderResult(r) {
 
   if (r.solver === "failover") {
     renderFailover(r, banner, body);
+    appendSequencePanel(r);
     drawCanvas();
     return;
   }
@@ -281,6 +285,7 @@ function renderResult(r) {
       <h3>各管段状态</h3>
       ${segmentStatusTable(r.segment_status)}
     </div>`;
+  appendSequencePanel(r);
   drawCanvas();
 }
 
@@ -361,6 +366,133 @@ function renderFailover(r, banner, body) {
       <h3>各管段状态（正常执行时）</h3>
       ${segmentStatusTable(r.segment_status)}
     </div>`;
+}
+
+// ---------- 现场执行顺序规划 ----------
+// 入口: 可行方案详情(历史方案"查看"或刚求解出的方案)下方的规划卡片。
+// 只读计算, 不修改原方案。
+function appendSequencePanel(r) {
+  const body = $("#result-body");
+  const card = document.createElement("div");
+  card.className = "card";
+  card.id = "sequence-card";
+
+  if (r.id == null) {
+    return; // 未入库结果不提供规划入口
+  }
+
+  const leakIds = (r.node_status || [])
+    .filter((n) => n.role === "leak")
+    .map((n) => n.id);
+
+  if (!r.closed_valves.length) {
+    card.innerHTML = `
+      <h3>④ 现场执行顺序规划</h3>
+      <p class="role-name">该可行方案不关闭任何阀门, 无操作时段, 累计暴露量为 0, 无需规划执行顺序。</p>`;
+    body.appendChild(card);
+    return;
+  }
+
+  const valveById = new Map(state.valves.map((v) => [v.id, v]));
+  card.innerHTML = `
+    <h3>现场执行顺序规划 <span class="role-name">(只读计算, 不修改原方案)</span></h3>
+    <p class="role-name">
+      按方案快照为<b>每枚计划阀门</b>录入正整数操作时长(分钟), 为<b>每个漏点</b>录入正整数漏水权重。
+      操作期间该阀仍开启; 每步完成后按多进水点连通性更新仍通水漏点;
+      最小化各时段「时长 × 仍通水漏点权重之和」的累计暴露量, 同暴露量取阀门编号序列字典序最小的唯一顺序。
+    </p>
+    <div class="grid-two">
+      <div>
+        <h4>计划阀门操作时长（分钟）</h4>
+        <table id="table-durations"><thead><tr>
+          <th>阀门编号</th><th>绑定管段</th><th>关闭代价</th><th>操作时长</th>
+        </tr></thead><tbody>
+        ${r.closed_valves.map((id) => {
+          const v = valveById.get(id) || {};
+          return `<tr><td><b>${esc(id)}</b></td>
+            <td>${esc(v.segment_id || "—")}</td>
+            <td>${esc(v.cost ?? "—")}</td>
+            <td><input data-dur="${esc(id)}" type="number" min="1" step="1" value="1"></td></tr>`;
+        }).join("")}
+        </tbody></table>
+      </div>
+      <div>
+        <h4>漏点漏水权重</h4>
+        <table id="table-weights"><thead><tr>
+          <th>漏点编号</th><th>漏水权重</th>
+        </tr></thead><tbody>
+        ${leakIds.map((id) => `<tr><td><b>${esc(id)}</b></td>
+          <td><input data-w="${esc(id)}" type="number" min="1" step="1" value="1"></td></tr>`).join("")}
+        </tbody></table>
+      </div>
+    </div>
+    <p>
+      <button id="btn-sequence" type="button" class="primary">计算最优执行顺序</button>
+    </p>
+    <div id="sequence-errors" class="errors hidden"></div>
+    <div id="sequence-result"></div>`;
+  body.appendChild(card);
+  $("#btn-sequence").addEventListener("click", () => computeSequence(r));
+}
+
+async function computeSequence(r) {
+  const errBox = $("#sequence-errors");
+  const resBox = $("#sequence-result");
+  errBox.classList.add("hidden");
+  resBox.innerHTML = "";
+
+  const collect = (attr) => {
+    const out = {};
+    document.querySelectorAll(`#sequence-card input[data-${attr}]`).forEach((inp) => {
+      out[inp.dataset[attr]] = inp.value.trim() === "" ? null : Number(inp.value);
+    });
+    return out;
+  };
+  const payload = { durations: collect("dur"), leak_weights: collect("w") };
+
+  try {
+    const res = await api("POST", `/api/plans/${r.id}/sequence`, payload);
+    renderSequenceResult(res);
+  } catch (err) {
+    errBox.innerHTML = `<b>无法规划执行顺序:</b><ul>${
+      String(err.message).split("\n").map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+    errBox.classList.remove("hidden");
+  }
+}
+
+function renderSequenceResult(res) {
+  const box = $("#sequence-result");
+  const leakCell = (arr) => arr.length
+    ? esc(arr.join(", "))
+    : `<span class="tag isolated">无（全部隔离）</span>`;
+  box.innerHTML = `
+    <div class="banner ok">
+      <span class="big">✓ 最优执行顺序: ${esc(res.sequence.join(" → "))}</span>
+      总时长 <b>${res.total_duration}</b> 分钟, 累计暴露量 <b>${res.total_exposure}</b>
+      <br><small>执行前仍通水漏点: ${
+        esc(res.initial_flowing_leaks.join(", ")) || "无"}（权重和 ${
+        res.initial_flowing_weight}）；全部步骤完成后仍通水漏点: ${
+        esc(res.final_flowing_leaks.join(", ")) || "无"}。
+        第 k 步暴露量 = 该阀时长 × 操作期间(该阀仍开启)仍通水漏点权重之和。</small>
+    </div>
+    <table><thead><tr>
+      <th>步骤</th><th>关闭阀门</th><th>绑定管段</th><th>时长(分钟)</th>
+      <th>起止时间(分钟)</th><th>操作期间仍通水漏点(权重和)</th><th>本步暴露量</th>
+      <th>刚隔离的漏点</th><th>完成后仍通水漏点(权重和)</th><th>累计暴露量</th>
+    </tr></thead><tbody>
+    ${res.steps.map((st) => `<tr>
+      <td>${st.order}</td>
+      <td><b>${esc(st.valve_id)}</b></td>
+      <td>${esc(st.segment_id)}</td>
+      <td>${st.duration}</td>
+      <td>${st.start} → ${st.end}</td>
+      <td>${leakCell(st.flowing_leaks_during)}（${st.flowing_weight_during}）</td>
+      <td>${st.exposure}</td>
+      <td>${st.newly_isolated_leaks.length ? esc(st.newly_isolated_leaks.join(", ")) : "—"}</td>
+      <td>${leakCell(st.flowing_leaks_after)}（${st.flowing_weight_after}）</td>
+      <td><b>${st.cumulative_exposure}</b></td>
+    </tr>`).join("")}
+    </tbody></table>`;
 }
 
 // ---------- 历史 ----------

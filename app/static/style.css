@@ -35,7 +35,8 @@ section { margin-bottom: 26px; }
 h2 { font-size: 18px; border-left: 4px solid #1c7fb3; padding-left: 10px; }
 h3 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 10px; }
 .grid-three { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
-@media (max-width: 1000px) { .grid-three { grid-template-columns: 1fr; } }
+.grid-two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 1000px) { .grid-three, .grid-two { grid-template-columns: 1fr; } }
 .card {
   background: #fff;
   border: 1px solid #e1e7ee;

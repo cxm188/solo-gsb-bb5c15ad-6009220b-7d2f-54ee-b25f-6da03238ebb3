@@ -7,6 +7,7 @@ API:
   POST /api/plan-failover           单阀失效备援求解并保存方案
   GET  /api/plans                   最近方案列表
   GET  /api/plans/{id}              方案详情(含节点/管段状态)
+  POST /api/plans/{id}/sequence     可行方案的现场执行顺序规划(只读计算)
   POST /api/demo                    恢复内置示例管网
   POST /api/clear                   清空管网输入
 """
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -24,7 +25,8 @@ from pydantic import BaseModel, Field, field_validator
 
 import database
 from demo import DEMO_NETWORK
-from solver import MAX_VALVES, NetworkValidationError, solve, solve_failover
+from solver import (MAX_VALVES, NetworkValidationError, plan_sequence, solve,
+                    solve_failover)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -69,6 +71,15 @@ class NetworkIn(BaseModel):
     nodes: list[NodeIn] = Field(default_factory=list)
     segments: list[SegmentIn] = Field(default_factory=list)
     valves: list[ValveIn] = Field(default_factory=list, max_length=MAX_VALVES)
+
+
+class SequenceIn(BaseModel):
+    """执行顺序规划录入: 计划阀门操作时长 + 漏点漏水权重。
+
+    值的正整数校验在 solver.plan_sequence 中逐条进行, 以便返回明确错误。
+    """
+    durations: dict[str, Any] = Field(default_factory=dict)
+    leak_weights: dict[str, Any] = Field(default_factory=dict)
 
 
 @asynccontextmanager
@@ -156,6 +167,35 @@ def get_plan(plan_id: int) -> dict:
     if plan is None:
         raise HTTPException(status_code=404, detail="方案不存在")
     return plan
+
+
+@app.post("/api/plans/{plan_id}/sequence")
+def plan_execution_sequence(plan_id: int, seq: SequenceIn) -> dict:
+    """已保存可行方案的现场执行顺序规划(独立 API)。
+
+    只读计算: 仅读取方案及其管网快照, 不修改、不新增任何数据。
+    不可行方案、遗漏/多余编号、非正整数数值都会返回明确错误。
+    """
+    with database.get_conn() as conn:
+        plan = database.get_plan(conn, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    if not plan.get("feasible"):
+        reason = plan.get("reason_code")
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"方案 #{plan_id} 为不可行方案"
+            + (f"(reason_code: {reason})" if reason else "")
+            + ", 没有可执行的关阀清单, 不能规划执行顺序"
+        ]})
+    try:
+        result = plan_sequence(plan["network_snapshot"],
+                               plan.get("closed_valves", []),
+                               seq.durations, seq.leak_weights)
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    result["plan_id"] = plan_id
+    result["solver"] = plan.get("solver", "base")
+    return result
 
 
 @app.post("/api/demo")
