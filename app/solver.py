@@ -16,6 +16,14 @@
     绑定管段保持通水)时, (A)(B) 仍然成立。位掩码 M 的方案备援可行, 当且
     仅当 M 本身以及每个 M\\{j}(j∈M) 都是常规可行方案。
 
+执行顺序规划:
+  - solve_schedule(payload, closed_valves, durations, weights): 针对已保存
+    可行方案的计划关阀清单, 规划现场操作顺序。操作某枚阀门期间它仍开启,
+    该操作时段的暴露量 = 操作时长 x 此时段仍通水漏点的权重和(按多进水点
+    连通性判定); 所有计划阀门都要执行, 目标为最小化累计暴露量, 同暴露量
+    时取阀门编号序列字典序最小的唯一顺序。计划阀门 m<=14, 用 2^m 子集 DP
+    保证全局最优。
+
 阀门最多 14 个, 枚举全部 2^V 个子集(V<=14 => 16384), 对每个子集做
 BFS 连通性检查即可, 简单且确定。
 """
@@ -375,6 +383,204 @@ def solve_failover(payload: dict[str, Any]) -> dict[str, Any]:
         f"(保持开启)时, 全部漏点均与进水点断开、全部必保点仍有供水。"
     )
     return result
+
+
+class ScheduleValidationError(ValueError):
+    """执行顺序规划的录入数据不合法, errors 字段携带逐条原因。"""
+
+    def __init__(self, errors: list[str]):
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+def _pos_int_or_error(value: Any, what: str,
+                      errors: list[str]) -> int | None:
+    """把录入值规整为正整数; 非法时记录一条错误并返回 None。"""
+    if isinstance(value, bool):
+        errors.append(f"{what}: 必须是正整数, 不能是布尔值")
+        return None
+    if isinstance(value, int):
+        num = value
+    elif isinstance(value, float) and value.is_integer():
+        num = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        num = int(value.strip())
+    else:
+        errors.append(f"{what}: 必须是正整数(收到 {value!r})")
+        return None
+    if num <= 0:
+        errors.append(f"{what}: 必须是正整数(收到 {num})")
+        return None
+    return num
+
+
+def solve_schedule(payload: dict[str, Any], closed_valves: list[str],
+                   raw_durations: Any, raw_leak_weights: Any) -> dict[str, Any]:
+    """为已保存的可行关阀方案规划现场执行顺序(只读计算, 不改库)。
+
+    模型:
+      - 计划阀门全部要执行; 操作某枚阀门期间它仍开启, 该步完成后才关闭。
+      - 第 k 步(操作阀门 v, 此前已关集合为 S)的暴露量
+        = v 的操作时长 x 关闭 S 后仍通水漏点的权重和(多进水点连通性)。
+      - 目标: 最小化各步暴露量之和(累计暴露量); 同暴露量时取阀门编号序列
+        字典序最小的唯一顺序。
+
+    校验(不通过时抛 ScheduleValidationError):
+      - 每枚计划阀门都必须有正整数操作时长, 不允许遗漏或多余编号;
+      - 快照中每个漏点都必须有正整数漏水权重, 不允许遗漏或多余编号。
+    """
+    nodes, segments, valves = validate_network(payload)
+    g = _Graph(nodes, segments, valves)
+
+    errors: list[str] = []
+    if raw_durations is None:
+        raw_durations = {}
+    if raw_leak_weights is None:
+        raw_leak_weights = {}
+    if not isinstance(raw_durations, dict):
+        errors.append("valve_durations 必须是对象: {阀门编号: 正整数操作时长(分钟)}")
+        raw_durations = {}
+    if not isinstance(raw_leak_weights, dict):
+        errors.append("leak_weights 必须是对象: {漏点编号: 正整数漏水权重}")
+        raw_leak_weights = {}
+
+    planned = sorted(_norm_id(v) for v in closed_valves)
+    planned_set = set(planned)
+    valve_by_id = {vl["id"]: vl for vl in g.valves_sorted}
+    for vid in planned:
+        if vid not in valve_by_id:
+            errors.append(f"计划阀门 {vid} 不存在于方案快照的管网中")
+
+    # ---- 操作时长: 遗漏 / 多余编号 / 非法数值 ----
+    norm_durations = {_norm_id(k): v for k, v in raw_durations.items()}
+    durations: dict[str, int] = {}
+    for vid, raw_val in norm_durations.items():
+        if vid not in planned_set:
+            errors.append(f"操作时长包含计划清单之外的阀门编号: {vid or '(空)'}")
+            continue
+        val = _pos_int_or_error(raw_val, f"阀门 {vid} 的操作时长", errors)
+        if val is not None:
+            durations[vid] = val
+    for vid in planned:
+        if vid not in norm_durations:
+            errors.append(f"缺少计划阀门 {vid} 的操作时长")
+
+    # ---- 漏水权重: 遗漏 / 多余编号 / 非法数值 ----
+    leak_nodes = [nd for nd in g.nodes if nd["role"] == "leak"]
+    leak_id_set = {nd["id"] for nd in leak_nodes}
+    norm_weights = {_norm_id(k): v for k, v in raw_leak_weights.items()}
+    weights: dict[str, int] = {}
+    for nid, raw_val in norm_weights.items():
+        if nid not in leak_id_set:
+            errors.append(f"漏水权重包含快照中不存在的漏点编号: {nid or '(空)'}")
+            continue
+        val = _pos_int_or_error(raw_val, f"漏点 {nid} 的漏水权重", errors)
+        if val is not None:
+            weights[nid] = val
+    for nd in leak_nodes:
+        if nd["id"] not in norm_weights:
+            errors.append(f"缺少漏点 {nd['id']} 的漏水权重")
+
+    if errors:
+        raise ScheduleValidationError(errors)
+
+    # ---- 预计算计划阀门的每个子集: 关阀掩码 / 仍通水漏点 / 权重和 ----
+    m = len(planned)
+    gbit = {vl["id"]: b for b, vl in enumerate(g.valves_sorted)}
+    pbits = [1 << gbit[vid] for vid in planned]
+    pdur = [durations[vid] for vid in planned]
+    weight_of_idx = [0] * g.n
+    for i in g.leak_set:
+        weight_of_idx[i] = weights[g.nodes[i]["id"]]
+
+    n_sub = 1 << m
+    flow_bits = [0] * n_sub      # 该子集关闭后仍通水漏点的节点位掩码
+    flow_weight = [0] * n_sub    # 对应的漏点权重和
+    gmask_of = [0] * n_sub       # 该子集对应的图关阀掩码(lowbit 递推)
+    for s in range(1, n_sub):
+        low = s & -s
+        gmask_of[s] = gmask_of[s ^ low] | pbits[low.bit_length() - 1]
+    for s in range(n_sub):
+        fed = g.reachable(gmask_of[s], g.inlet_set)
+        fl = fed & g.leak_bits
+        flow_bits[s] = fl
+        w = 0
+        b = fl
+        while b:
+            low = b & -b
+            w += weight_of_idx[low.bit_length() - 1]
+            b ^= low
+        flow_weight[s] = w
+
+    # ---- 子集 DP: f[s] = (完成集合 s 的最小累计暴露量, 字典序最小序列) ----
+    best_exp: list[int | None] = [None] * n_sub
+    best_seq: list[tuple[int, ...] | None] = [None] * n_sub
+    best_exp[0] = 0
+    best_seq[0] = ()
+    for s in range(1, n_sub):
+        for j in range(m):
+            if not (s >> j) & 1:
+                continue
+            prev = s ^ (1 << j)
+            cand_exp = best_exp[prev] + pdur[j] * flow_weight[prev]
+            cand_seq = best_seq[prev] + (j,)
+            if (best_exp[s] is None or cand_exp < best_exp[s]
+                    or (cand_exp == best_exp[s] and cand_seq < best_seq[s])):
+                best_exp[s] = cand_exp
+                best_seq[s] = cand_seq
+
+    # ---- 按最优顺序生成每步明细 ----
+    def leak_list(bits: int) -> list[dict[str, Any]]:
+        return [
+            {"id": g.nodes[i]["id"], "label": g.nodes[i]["label"],
+             "weight": weights[g.nodes[i]["id"]]}
+            for i in sorted(g.leak_set) if (bits >> i) & 1
+        ]
+
+    order = best_seq[n_sub - 1]
+    steps: list[dict[str, Any]] = []
+    t = 0
+    cum = 0
+    s = 0
+    prev_flow = flow_bits[0]
+    for k, j in enumerate(order):
+        vid = planned[j]
+        dur = pdur[j]
+        exp_k = dur * flow_weight[s]   # 操作期间该阀仍开启, 按已关集合 s 计
+        cum += exp_k
+        s |= 1 << j
+        fl_after = flow_bits[s]
+        newly = prev_flow & ~fl_after
+        steps.append({
+            "step": k + 1,
+            "valve_id": vid,
+            "segment_id": valve_by_id[vid]["segment_id"],
+            "duration": dur,
+            "start": t,
+            "end": t + dur,
+            "step_exposure": exp_k,
+            "cumulative_exposure": cum,
+            "newly_isolated_leaks": leak_list(newly),
+            "flowing_leaks_after": leak_list(fl_after),
+        })
+        t += dur
+        prev_flow = fl_after
+
+    order_ids = [planned[j] for j in order]
+    return {
+        "feasible": True,
+        "planned_valves": planned,
+        "order": order_ids,
+        "total_duration": t,
+        "total_exposure": cum,
+        "initial_flowing_leaks": leak_list(flow_bits[0]),
+        "already_isolated_leaks": leak_list(g.leak_bits & ~flow_bits[0]),
+        "steps": steps,
+        "message": (
+            f"最优执行顺序: {' → '.join(order_ids) or '(无需关闭任何阀门)'}; "
+            f"总耗时 {t} 分钟, 累计暴露量 {cum}。"
+        ),
+    }
 
 
 def _scenario_check(g: _Graph, mask: int, failed_bit: int | None) -> dict[str, Any]:

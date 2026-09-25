@@ -7,6 +7,7 @@ API:
   POST /api/plan-failover           单阀失效备援求解并保存方案
   GET  /api/plans                   最近方案列表
   GET  /api/plans/{id}              方案详情(含节点/管段状态)
+  POST /api/plans/{id}/schedule     已保存可行方案的现场执行顺序规划(只读)
   POST /api/demo                    恢复内置示例管网
   POST /api/clear                   清空管网输入
 """
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -24,7 +25,8 @@ from pydantic import BaseModel, Field, field_validator
 
 import database
 from demo import DEMO_NETWORK
-from solver import MAX_VALVES, NetworkValidationError, solve, solve_failover
+from solver import (MAX_VALVES, NetworkValidationError, ScheduleValidationError,
+                    solve, solve_failover, solve_schedule)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -69,6 +71,13 @@ class NetworkIn(BaseModel):
     nodes: list[NodeIn] = Field(default_factory=list)
     segments: list[SegmentIn] = Field(default_factory=list)
     valves: list[ValveIn] = Field(default_factory=list, max_length=MAX_VALVES)
+
+
+class ScheduleIn(BaseModel):
+    """执行顺序规划录入: 具体键值合法性由 solve_schedule 逐条校验。"""
+
+    valve_durations: Any = None   # {计划阀门编号: 正整数操作时长(分钟)}
+    leak_weights: Any = None      # {漏点编号: 正整数漏水权重}
 
 
 @asynccontextmanager
@@ -156,6 +165,35 @@ def get_plan(plan_id: int) -> dict:
     if plan is None:
         raise HTTPException(status_code=404, detail="方案不存在")
     return plan
+
+
+@app.post("/api/plans/{plan_id}/schedule")
+def plan_execution_schedule(plan_id: int, body: ScheduleIn | None = None) -> dict:
+    """已保存可行方案的现场执行顺序规划(独立 API, 只读计算、不改原方案)。
+
+    按方案快照录入每枚计划阀门的正整数操作时长(分钟)与每个漏点的正整数
+    漏水权重, 返回最小化累计暴露量的执行顺序及每步明细。
+    """
+    with database.get_conn() as conn:
+        plan = database.get_plan(conn, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    if not plan.get("feasible"):
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"方案 #{plan_id} 不可行(求解结果为无解), 不能规划执行顺序; "
+            "仅可行的已保存方案支持现场执行顺序规划。"
+        ]})
+    durations = body.valve_durations if body is not None else None
+    leak_weights = body.leak_weights if body is not None else None
+    try:
+        schedule = solve_schedule(plan["network_snapshot"],
+                                  plan.get("closed_valves") or [],
+                                  durations, leak_weights)
+    except (ScheduleValidationError, NetworkValidationError) as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    schedule["plan_id"] = plan_id
+    schedule["solver"] = plan.get("solver", "base")
+    return schedule
 
 
 @app.post("/api/demo")

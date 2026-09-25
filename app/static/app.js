@@ -252,12 +252,14 @@ function renderResult(r) {
   if (!r.feasible) {
     renderInfeasible(r, banner, body);
     drawCanvas();
+    updateScheduleSection(r);
     return;
   }
 
   if (r.solver === "failover") {
     renderFailover(r, banner, body);
     drawCanvas();
+    updateScheduleSection(r);
     return;
   }
 
@@ -282,6 +284,7 @@ function renderResult(r) {
       ${segmentStatusTable(r.segment_status)}
     </div>`;
   drawCanvas();
+  updateScheduleSection(r);
 }
 
 function renderInfeasible(r, banner, body) {
@@ -393,6 +396,105 @@ $("#table-plans").addEventListener("click", async (e) => {
   $("#section-result").scrollIntoView({ behavior: "smooth" });
 });
 
+// ---------- 现场执行顺序规划 ----------
+// 入口: 展示任一已保存可行方案(新求解或历史方案详情)时, 自动出现录入区
+function updateScheduleSection(r) {
+  const sec = $("#section-schedule");
+  if (!r || !r.feasible || !r.id) {
+    sec.classList.add("hidden");
+    return;
+  }
+  sec.classList.remove("hidden");
+  $("#sched-plan-id").textContent = r.id;
+  $("#schedule-result").innerHTML = "";
+  hideScheduleErrors();
+
+  // 录入内容以方案结果(快照求解产物)为准, 与当前编辑区无关
+  const segOf = new Map((r.segment_status || [])
+    .filter((s) => s.valve_id).map((s) => [s.valve_id, s.id]));
+  $("#table-sched-valves tbody").innerHTML = r.closed_valves.length
+    ? r.closed_valves.map((vid) => `
+      <tr>
+        <td><b>${esc(vid)}</b></td>
+        <td>${esc(segOf.get(vid) || "—")}</td>
+        <td><input data-sched-valve="${esc(vid)}" type="number" min="1" step="1" value="1"></td>
+      </tr>`).join("")
+    : `<tr><td colspan="3" class="role-name">该方案无需关闭任何阀门</td></tr>`;
+
+  const leaks = (r.node_status || []).filter((n) => n.role === "leak");
+  $("#table-sched-leaks tbody").innerHTML = leaks.length
+    ? leaks.map((n) => `
+      <tr>
+        <td>${esc(n.id)}${n.label && n.label !== n.id ? ` <span class="role-name">(${esc(n.label)})</span>` : ""}</td>
+        <td><input data-sched-leak="${esc(n.id)}" type="number" min="1" step="1" value="1"></td>
+      </tr>`).join("")
+    : `<tr><td colspan="2" class="role-name">方案快照中没有漏点</td></tr>`;
+}
+
+function showScheduleErrors(errors) {
+  const box = $("#schedule-errors");
+  box.innerHTML = `<b>执行顺序规划录入存在问题:</b><ul>${errors.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+  box.classList.remove("hidden");
+}
+function hideScheduleErrors() {
+  $("#schedule-errors").classList.add("hidden");
+}
+
+function leakTags(lst) {
+  return lst.length
+    ? lst.map((l) => `<span class="tag isolated">${esc(l.id)}(权重${esc(l.weight)})</span>`).join(" ")
+    : '<span class="role-name">—</span>';
+}
+
+function renderSchedule(res) {
+  const rows = res.steps.map((st) => `
+    <tr>
+      <td>${st.step}</td>
+      <td><b>${esc(st.valve_id)}</b> <span class="role-name">(管段 ${esc(st.segment_id)})</span></td>
+      <td>${st.start} → ${st.end}</td>
+      <td>${st.duration}</td>
+      <td>${leakTags(st.newly_isolated_leaks)}</td>
+      <td>${leakTags(st.flowing_leaks_after)}</td>
+      <td>${st.step_exposure}</td>
+      <td><b>${st.cumulative_exposure}</b></td>
+    </tr>`).join("");
+  $("#schedule-result").innerHTML = `
+    <div class="banner ok"><span class="big">✓ 最优执行顺序</span>${esc(res.message)}</div>
+    <div class="card">
+      <h3>执行步骤（方案 #${esc(res.plan_id)}，共 ${res.steps.length} 步，
+        总耗时 ${res.total_duration} 分钟，累计暴露量 ${res.total_exposure}）</h3>
+      <p class="role-name">操作开始前仍通水漏点: ${leakTags(res.initial_flowing_leaks)}
+        ${res.already_isolated_leaks.length ? `；本来已隔离(不计暴露): ${leakTags(res.already_isolated_leaks)}` : ""}</p>
+      <table><thead><tr>
+        <th>步骤</th><th>操作阀门</th><th>起止时间(分钟)</th><th>时长(分钟)</th>
+        <th>刚隔离的漏点</th><th>仍通水的漏点</th><th>本步暴露量</th><th>累计暴露量</th>
+      </tr></thead>
+      <tbody>${rows || `<tr><td colspan="8" class="role-name">无需执行任何关阀操作</td></tr>`}</tbody></table>
+    </div>`;
+  $("#section-schedule").scrollIntoView({ behavior: "smooth" });
+}
+
+$("#btn-schedule").addEventListener("click", async () => {
+  hideScheduleErrors();
+  const r = state.result;
+  if (!r || !r.id) return;
+  const valve_durations = {};
+  document.querySelectorAll("[data-sched-valve]").forEach((inp) => {
+    valve_durations[inp.dataset.schedValve] = inp.value.trim();
+  });
+  const leak_weights = {};
+  document.querySelectorAll("[data-sched-leak]").forEach((inp) => {
+    leak_weights[inp.dataset.schedLeak] = inp.value.trim();
+  });
+  try {
+    const res = await api("POST", `/api/plans/${r.id}/schedule`,
+      { valve_durations, leak_weights });
+    renderSchedule(res);
+  } catch (err) {
+    showScheduleErrors(String(err.message).split("\n"));
+  }
+});
+
 // ---------- 顶部按钮 ----------
 $("#btn-demo").addEventListener("click", async () => {
   const net = await api("POST", "/api/demo");
@@ -407,6 +509,7 @@ $("#btn-clear").addEventListener("click", async () => {
   state.result = null;
   $("#result-body").innerHTML = "";
   $("#result-banner").classList.add("hidden");
+  $("#section-schedule").classList.add("hidden");
   renderAll();
   loadHistory();
 });
@@ -454,6 +557,7 @@ function applyNetwork(net) {
   state.result = null;
   $("#result-body").innerHTML = "";
   $("#result-banner").classList.add("hidden");
+  $("#section-schedule").classList.add("hidden");
   renderAll();
 }
 

@@ -82,8 +82,40 @@
     <div id="result-body"></div>
   </section>
 
+  <section id="section-schedule" class="hidden">
+    <h2>③ 现场执行顺序规划</h2>
+    <div class="card">
+      <h3>按方案快照录入（方案 #<span id="sched-plan-id"></span>）</h3>
+      <p class="role-name">为每枚计划阀门填写正整数操作时长（分钟），为快照中每个漏点填写正整数漏水权重。
+        操作期间该阀仍开启；每步完成后按多进水点连通性更新仍通水漏点，
+        目标为最小化各操作时段「时长 × 仍通水漏点权重之和」的累计暴露量；
+        所有计划阀门都会执行，同暴露量时取阀门编号序列字典序最小的唯一顺序。
+        计算只读，不会修改原方案。</p>
+      <div class="grid-two">
+        <div>
+          <h4>计划阀门操作时长</h4>
+          <table id="table-sched-valves">
+            <thead><tr><th>阀门编号</th><th>绑定管段</th><th>操作时长（分钟）</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div>
+          <h4>漏点漏水权重</h4>
+          <table id="table-sched-leaks">
+            <thead><tr><th>漏点</th><th>漏水权重</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <button id="btn-schedule" class="primary" type="button">计算最优执行顺序</button>
+      <div id="schedule-errors" class="errors hidden"></div>
+    </div>
+    <div id="schedule-result"></div>
+  </section>
+
   <section id="section-history">
-    <h2>③ 历史方案</h2>
+    <h2>④ 历史方案</h2>
+    <p class="role-name">点击「查看」回看任一方案；可行方案会在上方 ③ 中打开现场执行顺序规划入口。</p>
     <table id="table-plans">
       <thead><tr><th>#</th><th>时间(UTC)</th><th>类型</th><th>是否可行</th><th>总代价</th><th>关闭阀门</th><th></th></tr></thead>
       <tbody></tbody>
